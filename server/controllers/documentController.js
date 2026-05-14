@@ -60,68 +60,72 @@ const uploadPDF = async (req, res) => {
 
     console.log(`PDF extracted successfully. Total chunks to process: ${chunks.length}`);
 
-    // 4. Generate embeddings and store in Supabase
+    // 4. Generate embeddings in batches (Max 100 per request for Gemini)
+    const BATCH_SIZE = 30; // Reduced batch size for better stability
     const allRecords = [];
     let errorCount = 0;
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      let embedding = [];
-      console.log(`Processing chunk ${i + 1}/${chunks.length}...`);
-      
-      try {
-        // Reduced delay to 500ms for faster processing. Retry logic will handle rate limits.
-        await new Promise(resolve => setTimeout(resolve, 500));
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batchChunks = chunks.slice(i, i + BATCH_SIZE);
+      console.log(`Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(chunks.length / BATCH_SIZE)}...`);
 
-        let retries = 0;
-        const maxRetries = 3;
-        let success = false;
+      let retries = 0;
+      const maxRetries = 5;
+      let success = false;
 
-        while (retries < maxRetries && !success) {
-          try {
-            const embeddingResponse = await embeddingModel.embedContent(chunk);
-            embedding = embeddingResponse.embedding.values;
-            success = true;
-          } catch (retryError) {
-            if (retryError.message.includes('429') || retryError.message.includes('quota')) {
-              retries++;
-              const waitTime = Math.pow(2, retries) * 2000; // Exponential backoff
-              console.log(`Rate limited on chunk ${i+1}. Waiting ${waitTime}ms before retry ${retries}/${maxRetries}...`);
-              await new Promise(resolve => setTimeout(resolve, waitTime));
-            } else {
-              throw retryError;
-            }
+      while (retries < maxRetries && !success) {
+        try {
+          const batchResponse = await embeddingModel.batchEmbedContents({
+            requests: batchChunks.map(chunk => ({
+              content: { role: 'user', parts: [{ text: chunk }] },
+              model: "models/text-embedding-004"
+            }))
+          });
+
+          const embeddings = batchResponse.embeddings;
+          
+          batchChunks.forEach((chunk, index) => {
+            allRecords.push({
+              content: chunk,
+              embedding: embeddings[index].values
+            });
+          });
+          
+          success = true;
+          // Add a small delay after a successful batch to avoid hitting RPM limits
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+        } catch (geminiError) {
+          if (geminiError.message.includes('429') || geminiError.message.includes('quota')) {
+            retries++;
+            const waitTime = Math.pow(2, retries) * 2000; // Exponential backoff: 4s, 8s, 16s...
+            console.log(`Rate limited on batch ${Math.floor(i / BATCH_SIZE) + 1}. Waiting ${waitTime}ms before retry ${retries}/${maxRetries}...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+          } else {
+            console.error(`Unexpected error in batch ${i}:`, geminiError.message);
+            break; // Exit retry loop for non-rate-limit errors
           }
         }
-        
-        if (!success) {
-          console.log(`Failed to generate embedding for chunk ${i+1} after ${maxRetries} retries. Using mock.`);
-          embedding = Array(3072).fill(Math.random());
-          errorCount++;
-        }
-      } catch (geminiError) {
-        console.log(`Error processing chunk ${i + 1}:`, geminiError.message);
-        embedding = Array(3072).fill(Math.random());
-        errorCount++;
       }
 
-      // Prepare record for Supabase insertion
-      const recordToInsert = {
-        content: chunk,
-        embedding: embedding,
-      };
-
-      // Insert into Supabase
-      const { error: insertError } = await supabase
-        .from('book_chunks')
-        .insert([recordToInsert]);
-
-      if (insertError) {
-        console.error(`Supabase insertion error on chunk ${i+1}:`, insertError);
-        // We continue even if one chunk fails insertion to avoid losing entire upload progress
+      if (!success) {
+        console.error(`Failed batch ${Math.floor(i / BATCH_SIZE) + 1} after ${maxRetries} retries.`);
+        errorCount += batchChunks.length;
       }
-      
-      allRecords.push(recordToInsert);
+    }
+
+    if (allRecords.length === 0) {
+      throw new Error('Failed to generate any embeddings.');
+    }
+
+    // 5. Bulk insert into Supabase
+    const { error: insertError } = await supabase
+      .from('book_chunks')
+      .insert(allRecords);
+
+    if (insertError) {
+      console.error('Supabase bulk insertion error:', insertError);
+      throw new Error(`Failed to store chunks in database: ${insertError.message}`);
     }
 
     res.status(200).json({ 
@@ -176,7 +180,17 @@ const askQuestion = async (req, res) => {
     }
 
     // 4. Generate Answer using Gemini
-    const systemPrompt = "You are an expert Hindi and Sanskrit knowledge assistant. Answer only using the provided context. If the answer is not found in the context, clearly say that the information is unavailable in the uploaded documents.";
+    const systemPrompt = `You are an intelligent AI assistant.
+
+Use the uploaded document context as the primary source of truth.
+
+If the retrieved context is incomplete or insufficient, you may supplement the answer using your general AI knowledge.
+
+Clearly distinguish:
+- information derived from the uploaded document
+- additional AI-generated explanation
+
+Provide detailed, educational, and helpful responses.`;
     
     try {
       // Configure model to use system instruction
@@ -184,7 +198,7 @@ const askQuestion = async (req, res) => {
         model: "gemini-2.5-flash",
         systemInstruction: systemPrompt,
         generationConfig: {
-          temperature: 0.3
+          temperature: 0.7
         }
       });
 
